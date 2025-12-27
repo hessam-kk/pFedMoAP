@@ -1,5 +1,6 @@
 import os.path as osp
 import os
+import sys
 import copy
 import time
 import torch
@@ -21,6 +22,14 @@ from Dassl.dassl.utils import count_num_param, load_checkpoint, load_pretrained_
 from trainers.promptfl import TextEncoder, load_clip_to_cpu
 
 import random
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PARENT_ROOT = os.path.dirname(ROOT_DIR)
+ISDA_CIFAR_ROOT = os.path.join(PARENT_ROOT, "ISDA-for-Deep-Networks", "Image classification on CIFAR")
+if os.path.isdir(ISDA_CIFAR_ROOT) and ISDA_CIFAR_ROOT not in sys.path:
+    sys.path.append(ISDA_CIFAR_ROOT)
+
+from ISDA import ISDALoss
 
 _tokenizer = _Tokenizer()
 
@@ -247,7 +256,6 @@ class PFEDMOAP(TrainerX):
         cfg = self.cfg
         self.num_experts = cfg.TRAINER.PFEDMOAP.NUM_EXPERTS
         classnames = self.dm.dataset.classnames
-        # print(self.dm.dataset)
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
@@ -267,12 +275,15 @@ class PFEDMOAP(TrainerX):
         print(f"# params: {count_num_param(self.model):,}")
         print(f"# prompt learner params: {count_num_param(self.model.prompt_learner):,}")
 
-
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
         
+        self.isda_head = nn.Linear(self.model.n_class, self.model.n_class).to(self.device)
+        self.isda_criterion = ISDALoss(self.model.n_class, self.model.n_class)
+        self.isda_lambda0 = 0.5
+
         self.lmbda = cfg.TRAINER.PFEDMOAP.LMBDA
         self.optim_p = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched_p = build_lr_scheduler(self.optim_p, cfg.OPTIM)
@@ -281,6 +292,10 @@ class PFEDMOAP(TrainerX):
         self.optim_g = build_optimizer(self.model.gating, cfg.OPTIMGATING)
         self.sched_g = build_lr_scheduler(self.optim_g, cfg.OPTIMGATING)
         self.register_model("gating", self.model.gating, self.optim_g, self.sched_g)
+
+        self.optim_isda = build_optimizer(self.isda_head, cfg.OPTIM)
+        self.sched_isda = build_lr_scheduler(self.optim_isda, cfg.OPTIM)
+        self.register_model("isda_head", self.isda_head, self.optim_isda, self.sched_isda)
 
         self.scaler = GradScaler() if cfg.TRAINER.PFEDMOAP.PREC == "amp" else None
 
@@ -355,32 +370,51 @@ class PFEDMOAP(TrainerX):
             # raise NotImplementedError(f"Method: {method} has not been implemented yet")
         raise ValueError(f"Unknown sparse selection method for experts: {method}")
 
-    
+        
     def forward_backward(self, batch, global_weight=None, fedprox=False, mu=0.5):
         image, label = self.parse_batch_train(batch)
         prec = self.cfg.TRAINER.PFEDMOAP.PREC
         if prec == "amp":
             with autocast():
-                output = self.model(image)
-                loss = F.cross_entropy(output, label)
+                base_logits = self.model(image)
+                ce_loss = F.cross_entropy(base_logits, label)
+
+                def _model_for_isda(x):
+                    return self.model(x)
+
+                ratio = self.isda_lambda0 * (self.epoch / max(1, self.max_epoch))
+                isda_loss, _ = self.isda_criterion(_model_for_isda, self.isda_head, image, label, ratio)
+
+                loss = ce_loss + isda_loss
+
             self.optim_p.zero_grad()
             self.optim_g.zero_grad()
+            self.optim_isda.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim_p)
             self.scaler.step(self.optim_g)
+            self.scaler.step(self.optim_isda)
             self.scaler.update()
         else:
-            output = self.model(image)
-            loss = F.cross_entropy(output, label)
+            base_logits = self.model(image)
+            ce_loss = F.cross_entropy(base_logits, label)
+
+            def _model_for_isda(x):
+                return self.model(x)
+
+            ratio = self.isda_lambda0 * (self.epoch / max(1, self.max_epoch))
+            isda_loss, _ = self.isda_criterion(_model_for_isda, self.isda_head, image, label, ratio)
+
+            loss = ce_loss + isda_loss
             self.model_backward_and_update(loss)
 
         loss_summary = {
             "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
+            "acc": compute_accuracy(base_logits, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
-            self.update_lr(["prompt_learner"])
+            self.update_lr(["prompt_learner", "isda_head"])
 
         return loss_summary
 
@@ -390,6 +424,10 @@ class PFEDMOAP(TrainerX):
         input = input.to(self.device)
         label = label.to(self.device)
         return input, label
+
+    def model_inference(self, input):
+        logits = self.model(input)
+        return logits
 
     def load_model(self, directory, epoch=None):
         if not directory:
